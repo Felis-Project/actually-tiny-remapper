@@ -6,9 +6,11 @@ asm = "9.6"
 
 [libraries]
 asm-commons = { module = "org.ow2.asm:asm-commons", version.ref = "asm" }
-asm-util = { module = "org.ow2.asm:asm-util", version.ref = "asm"}
-asm-tree = { module = "org.ow2.asm:asm-tree", version.ref = "asm"}
+asm-util = { module = "org.ow2.asm:asm-util", version.ref = "asm" }
+asm-tree = { module = "org.ow2.asm:asm-tree", version.ref = "asm" }
 
+[bundles]
+asm = ["asm-commons", "asm-tree", "asm-util"]
 
 [plugins]
 jvm = { id = "org.jetbrains.kotlin.jvm", version = "1.9.22" }

@@ -1,5 +1,4 @@
 plugins {
-    // Apply the org.jetbrains.kotlin.jvm Plugin to add support for Kotlin.
     alias(libs.plugins.jvm)
     `java-library`
     `maven-publish`
@@ -13,9 +12,7 @@ repositories {
 }
 
 dependencies {
-    implementation(libs.asm.commons)
-    implementation(libs.asm.tree)
-    implementation(libs.asm.util)
+    implementation(libs.bundles.asm)
 }
 
 java {
