@@ -12,7 +12,6 @@ import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import kotlin.io.path.*
 
-// TODO: Move this to an outside package
 fun <T> List<T>.chunkBy(pred: (T) -> Boolean): List<List<T>> {
     val res = mutableListOf<List<T>>()
 
