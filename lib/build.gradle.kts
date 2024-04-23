@@ -5,7 +5,7 @@ plugins {
 }
 
 group = "io.github.joemama"
-version = "1.0.0-alpha"
+version = "1.0.1-alpha"
 
 repositories {
     mavenCentral()
@@ -17,7 +17,15 @@ dependencies {
 
 java {
     toolchain {
-        languageVersion = JavaLanguageVersion.of(17)
+        languageVersion = JavaLanguageVersion.of(21)
+    }
+    targetCompatibility = JavaVersion.VERSION_21
+    sourceCompatibility = JavaVersion.VERSION_21
+}
+
+kotlin {
+    jvmToolchain {
+        languageVersion = JavaLanguageVersion.of(21)
     }
 }
 
