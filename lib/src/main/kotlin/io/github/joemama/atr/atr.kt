@@ -180,7 +180,7 @@ class VariableRenamingMethodVisitor(visitor: MethodVisitor, remapper: Remapper) 
     private var internalParameterCount = 0
 
     // private var internalVariableCount = 0
-    override fun visitParameter(name: String, access: Int) =
+    override fun visitParameter(name: String?, access: Int) =
         super.visitParameter("p${this.internalParameterCount++}", access)
 }
 
