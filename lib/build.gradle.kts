@@ -13,6 +13,9 @@ repositories {
 
 dependencies {
     implementation(libs.bundles.asm)
+
+    testImplementation("org.junit.jupiter:junit-jupiter:5.7.1")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher")
 }
 
 java {
@@ -27,6 +30,10 @@ kotlin {
     jvmToolchain {
         languageVersion = JavaLanguageVersion.of(21)
     }
+}
+
+tasks.named<Test>("test") {
+    useJUnitPlatform()
 }
 
 publishing {

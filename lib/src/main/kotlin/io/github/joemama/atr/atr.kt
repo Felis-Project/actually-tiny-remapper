@@ -2,15 +2,14 @@ package io.github.joemama.atr
 
 import org.objectweb.asm.*
 import org.objectweb.asm.commons.ClassRemapper
-import org.objectweb.asm.commons.MethodRemapper
 import org.objectweb.asm.commons.Remapper
-import java.io.File
 import java.nio.file.FileSystems
 import java.nio.file.Files
 import java.nio.file.Path
 import java.nio.file.StandardCopyOption
 import java.nio.file.StandardOpenOption
 import kotlin.io.path.*
+import kotlin.streams.asSequence
 
 fun <T> List<T>.chunkBy(pred: (T) -> Boolean): List<List<T>> {
     val res = mutableListOf<List<T>>()
@@ -33,112 +32,63 @@ fun <T> List<T>.chunkBy(pred: (T) -> Boolean): List<List<T>> {
 
 data class ClassMappings(val clazz: Class, val fields: List<Field>, val methods: List<Method>)
 
-data class Class(val name: String, val oldName: String, var superClass: String?, val interfaces: MutableList<String>) {
+data class ClassWrapper(val name: String, val superClass: String?, val interfaces: List<String>) {
     val parents: List<String> by lazy {
-        val res = mutableListOf(superClass)
-        res.addAll(interfaces)
-        res.filterNotNull()
-    }
-
-    companion object {
-        fun fromString(s: String): Class {
-            val (name, oldName) = s.split("->").map { it.trim() }
-            return Class(
-                name = name.replace(".", "/"),
-                oldName = oldName.split(":").first().replace(".", "/"),
-                // initialized by a class reader later
-                superClass = null,
-                interfaces = mutableListOf()
-            )
+        buildList {
+            addAll(interfaces)
+            superClass?.let { add(it) }
         }
     }
 }
 
-data class Field(val name: String, val type: String, val oldName: String) {
-    companion object {
-        fun fromString(s: String): Field {
-            val (new, old) = s.split("->").map { it.trim() }
-            val (type, name) = new.split(" ")
-            return Field(
-                name = name,
-                type = type,
-                oldName = old
-            )
-        }
-    }
+typealias ClassWrapperPool = Map<String, ClassWrapper>
+
+data class Class(val name: String, val oldName: String) {
+    val internalName by lazy { name.replace(".", "/") }
 }
+
+data class Field(val name: String, val type: String, val oldName: String)
 
 data class Method(
-    val parentClass: String,
     val name: String,
     val parameters: List<String>,
     val returnType: String,
     val oldName: String
 ) {
-    companion object {
-        fun fromString(classParent: String, method: String): Method {
-            val importantPart = method.split(":").last()
-            val (new, old) = importantPart.split("->").map(String::trim)
-            val (returnType, etc) = new.split(" ")
-            val (name, argTypes) = etc.split("(")
-            val properArgTypes = argTypes.substring(0, argTypes.lastIndex)
-            val parameters = properArgTypes.split(",").filter { it.isNotEmpty() }
-
-            return Method(
-                parentClass = classParent,
-                parameters = parameters,
-                returnType = returnType,
-                oldName = old,
-                name = name
-            )
-        }
-    }
+    constructor(name: String, desc: String, oldName: String) : this(
+        name,
+        Type.getMethodType(desc).argumentTypes.map { it.className }.toList(),
+        Type.getMethodType(desc).returnType.className,
+        oldName
+    )
 }
 
-class ProguardMappings(mappings: File) {
-    // unironically scary how this can fit in a one liner
-    private val classes: Map<String, ClassMappings> =
-        mappings.readLines().filter { !it.startsWith("#") }.chunkBy { !it.startsWith(" ") }.map { clazz ->
-            // we get a class mapping first
-            val parsedClass = Class.fromString(clazz[0])
-            // then field
-            val fieldz = clazz.subList(1, clazz.size)
-                .filter { !it.contains("(") }
-                .map(Field.Companion::fromString)
-            // then methods
-            val methodz = clazz.subList(1 + fieldz.size, clazz.size)
-                .filter { it.contains("(") }
-                .map { Method.fromString(parsedClass.name, it) }
-
-            ClassMappings(parsedClass, fieldz, methodz)
-        }.associateByTo(mutableMapOf()) { it.clazz.oldName }
-
-    operator fun get(oldName: String): ClassMappings? = this.classes[oldName]
-}
-
-class ProguardRemapper(mappings: File) : Remapper() {
-    val proguardMappings = ProguardMappings(mappings)
-
-    override fun map(internalName: String): String = this.proguardMappings[internalName]?.clazz?.name ?: internalName
+class AtrRemapper(
+    private val mappings: Mappings,
+    private val wrapperPool: Map<String, ClassWrapper>
+) : Remapper() {
+    override fun map(internalName: String): String = this.mappings[internalName]?.clazz?.internalName ?: internalName
     override fun mapMethodName(owner: String, name: String, descriptor: String): String {
         if (name == "<init>" || name == "<clinit>") return name
         // we are not in our mappings if null
-        val ownerClass = this.proguardMappings[owner] ?: return name
+        val ownerClass = this.mappings[owner] ?: return name
         // try to find in *this* class
         val newName = ownerClass.methods.find { this.doesMethodMatch(it, name, descriptor) }?.name
         // if not null we found it here
         if (newName != null) return newName
 
-        // otherwise we look at the parents
-        for (p in ownerClass.clazz.parents) {
-            val curr = this.mapMethodName(p, name, descriptor)
-            // if we match then we can exit
-            if (curr != name) {
-                return curr
+        // otherwise we look at the parents(if they exist)
+        this.wrapperPool[owner]?.let { wrapper ->
+            for (p in wrapper.parents) {
+                val curr = this.mapMethodName(p, name, descriptor)
+                // if we match then we can exit
+                if (curr != name) {
+                    return curr
+                }
             }
         }
 
-        // if we don't we have actually failed
+        // if we don't find it we have actually failed
         return name
     }
 
@@ -152,14 +102,17 @@ class ProguardRemapper(mappings: File) : Remapper() {
 
     // same login as #mapMethodName
     override fun mapFieldName(owner: String, name: String, descriptor: String): String {
-        val ownerClass = this.proguardMappings[owner] ?: return name
+        val ownerClass = this.mappings[owner] ?: return name
         val newName = ownerClass.fields.find { this.doesFieldMatch(it, name, descriptor) }?.name
         if (newName != null) return newName
 
-        for (p in ownerClass.clazz.parents) {
-            val res = this.mapFieldName(p, name, descriptor)
-            if (res != name) {
-                return res
+        this.wrapperPool[owner]?.let { wrapper ->
+            for (p in wrapper.parents) {
+                val curr = this.mapFieldName(p, name, descriptor)
+                // if we match then we can exit
+                if (curr != name) {
+                    return curr
+                }
             }
         }
 
@@ -176,45 +129,45 @@ class ProguardRemapper(mappings: File) : Remapper() {
     }
 }
 
-class VariableRenamingMethodVisitor(visitor: MethodVisitor, remapper: Remapper) : MethodRemapper(visitor, remapper) {
-    private var internalParameterCount = 0
-
-    // private var internalVariableCount = 0
-    override fun visitParameter(name: String?, access: Int) =
-        super.visitParameter("p${this.internalParameterCount++}", access)
-}
-
-class LoaderMakeClassRemapper(visitor: ClassVisitor, remapper: Remapper) : ClassRemapper(visitor, remapper) {
-    override fun createMethodRemapper(methodVisitor: MethodVisitor): MethodVisitor {
-        return VariableRenamingMethodVisitor(methodVisitor, this.remapper)
-    }
-
-    override fun visitSource(source: String?, debug: String?) {
-        super.visitSource(this.remapper.map(this.className).replace("/", ".") + ".java", debug)
-    }
-}
+//class VariableRenamingMethodVisitor(visitor: MethodVisitor, remapper: Remapper) : MethodRemapper(visitor, remapper) {
+//    private var internalParameterCount = 0
+//
+//    // private var internalVariableCount = 0
+//    override fun visitParameter(name: String?, access: Int) =
+//        super.visitParameter("p${this.internalParameterCount++}", access)
+//
+//    override fun visitLocalVariable(
+//        name: String,
+//        descriptor: String,
+//        signature: String?,
+//        start: Label,
+//        end: Label,
+//        index: Int
+//    ) {
+//        super.visitLocalVariable(name, descriptor, signature, start, end, index)
+//    }
+//}
 
 class JarRemapper(private val jarFile: Path) {
-    fun remap(mappings: File): Path {
+    fun remap(mappings: Mappings): Path {
         val jarPath = this.jarFile.resolveSibling(this.jarFile.nameWithoutExtension + "-remapped.jar")
-        if (jarPath.exists()) return jarPath
-
-        println("Remapping $jarFile using ${mappings.path}")
-        val mapper = ProguardRemapper(mappings)
+        if (jarPath.exists()) Files.delete(jarPath)
 
         FileSystems.newFileSystem(this.jarFile).use { originJar ->
             // first pass, parse hierarchy info
             // only classes may have hierarchy info so filter on that
-            for (clazz in Files.walk(originJar.getPath("/")).filter { it.extension == "class" }) {
-                Files.newInputStream(clazz).use {
-                    val reader = ClassReader(it)
-                    mapper.proguardMappings[reader.className]?.let { classMappings ->
-                        classMappings.clazz.superClass = reader.superName
-                        classMappings.clazz.interfaces.addAll(reader.interfaces)
+            val wrapperPool = Files.walk(originJar.getPath("/")).asSequence()
+                .filter { it.extension == "class" }
+                .map { clazz ->
+                    Files.newInputStream(clazz).use {
+                        val reader = ClassReader(it)
+                        ClassWrapper(reader.className, reader.superName, reader.interfaces.toList())
                     }
                 }
-            }
+                .associateBy { it.name }
+                .toMap()
 
+            val mapper = mappings.createRemapper(wrapperPool)
             // second pass, actually map
             FileSystems.newFileSystem(jarPath, mapOf("create" to "true")).use { outputJar ->
                 for (file in Files.walk(originJar.rootDirectories.first()).filter { !it.isDirectory() }) {
@@ -224,7 +177,7 @@ class JarRemapper(private val jarFile: Path) {
                     if (file.extension == "class") {
                         val reader = Files.newInputStream(file).use { ClassReader(it) }
                         val writer = ClassWriter(0)
-                        val remapper = LoaderMakeClassRemapper(writer, mapper)
+                        val remapper = ClassRemapper(writer, mapper)
                         reader.accept(remapper, 0)
 
                         val path = outputJar.getPath(mapper.map(reader.className).replace(".", "/") + ".class")
