@@ -149,8 +149,8 @@ class AtrRemapper(
 //}
 
 class JarRemapper(private val jarFile: Path) {
-    fun remap(mappings: Mappings): Path {
-        val jarPath = this.jarFile.resolveSibling(this.jarFile.nameWithoutExtension + "-remapped.jar")
+    fun remap(mappings: Mappings, outputJar: Path? = null): Path {
+        val jarPath = outputJar ?: this.jarFile.resolveSibling(this.jarFile.nameWithoutExtension + "-remapped.jar")
         if (jarPath.exists()) Files.delete(jarPath)
 
         FileSystems.newFileSystem(this.jarFile).use { originJar ->

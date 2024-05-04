@@ -72,7 +72,7 @@ class ProguardMappings(mappings: String) : Mappings {
     }
 }
 
-class TinyV1Mappings(mappings: String) : Mappings {
+class TinyV1Mappings(mappings: String, namespace: String) : Mappings {
     var classes: Map<String, ClassMappings>
         private set
 
@@ -81,42 +81,41 @@ class TinyV1Mappings(mappings: String) : Mappings {
         val header = lines.next().split('\t').iterator()
         check(header.next() == "v1") { "v1 header was not detected, aborting" }
         header.next() // 'from' namespace
-        header.next() // 'to' namespace
-        val otherNs = header.asSequence().toList()
-        check(otherNs.isEmpty()) { "Multiple namespaces are not supported by atr yet" }
+        val toNss = header.asSequence().toList()
+        val targetNsIndex = toNss.indexOf(namespace)
+        if (targetNsIndex == -1) throw IllegalArgumentException("Namespace $namespace is not specified in mappings. Available targets are $toNss")
         val classes = hashMapOf<String, String>()
         val fields = hashMapOf<String, MutableList<Field>>()
         val methods = hashMapOf<String, MutableList<Method>>()
 
-        var count = 0
         while (lines.hasNext()) {
             val curr = lines.next()
-            if (curr.startsWith('#')) continue
+            if (curr.startsWith('#') || curr.isEmpty()) continue
 
             val parts = curr.split('\t').listIterator()
             val type = parts.next()
             when (type) {
                 "CLASS" -> {
                     val oldName = parts.next()
+                    repeat(targetNsIndex) { parts.next() } // remove all other namespaces
                     val newName = Type.getObjectType(parts.next()).className
                     classes[oldName] = newName
-                    check(!parts.hasNext()) { "Multiple namespaces are not supported by atr yet" }
-                    count++
                 }
 
                 "FIELD" -> {
                     val owner = parts.next() // owner class in old 'from' namespace
                     val desc = parts.next() // desc in old 'from' namespace
                     val old = parts.next()
+                    repeat(targetNsIndex) { parts.next() }
                     val new = parts.next()
                     fields.getOrPut(owner, ::mutableListOf).add(Field(new, Type.getType(desc).className, old))
-                    check(!parts.hasNext()) { "Multiple namespaces are not supported by atr yet" }
                 }
 
                 "METHOD" -> {
                     val owner = parts.next()
                     val desc = parts.next()
                     val old = parts.next()
+                    repeat(targetNsIndex) { parts.next() }
                     val new = parts.next()
                     methods.getOrPut(owner, ::mutableListOf).add(Method(new, desc, old))
                 }
@@ -125,6 +124,7 @@ class TinyV1Mappings(mappings: String) : Mappings {
             }
         }
 
+        // also fix mapping types and descriptors
         this.classes = classes.entries.map { (old, new) ->
             val clazz = Class(new, old)
 
@@ -142,8 +142,6 @@ class TinyV1Mappings(mappings: String) : Mappings {
 
             ClassMappings(clazz, mappedFields, mappedMethods)
         }.associateBy { it.clazz.oldName }.toMap()
-        check(this.classes.size == classes.size) { "How did we get here?" }
-        check(this.classes.size == count) { "How did we get here?" }
     }
 
     override fun get(oldName: String): ClassMappings? = this.classes[oldName]
