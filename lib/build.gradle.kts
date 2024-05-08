@@ -24,6 +24,7 @@ java {
     }
     targetCompatibility = JavaVersion.VERSION_21
     sourceCompatibility = JavaVersion.VERSION_21
+    withSourcesJar()
 }
 
 kotlin {
