@@ -2,81 +2,210 @@ package io.github.joemama.atr
 
 import org.objectweb.asm.Type
 
-interface Mappings {
-    operator fun get(oldName: String): ClassMappings?
-    fun createRemapper(wrapperPool: ClassWrapperPool): AtrRemapper = AtrRemapper(this, wrapperPool)
+interface AtrParser {
+    fun parse(): AtrMappings
 }
 
-class ProguardMappings(mappings: String) : Mappings {
-    // unironically scary how this can fit in a one liner
-    val classes: Map<String, ClassMappings> =
-        mappings.lines()
-            .filter { !it.startsWith("#") }
-            .filter { it.isNotEmpty() }
-            .chunkBy { !it.startsWith(" ") }.map { clazz ->
-                // we get a class mapping first
-                val parsedClass = parseClassInfo(clazz[0])
-                // then field
-                val fieldz = clazz.subList(1, clazz.size)
-                    .filter { !it.contains("(") }
-                    .map { parseFieldInfo(it) }
-                // then methods
-                val methodz = clazz.subList(1 + fieldz.size, clazz.size)
-                    .filter { it.contains("(") }
-                    .map { parseMethodInfo(it) }
+interface AtrMappings {
+    val fields: Map<FieldInfo, String>
+    val methods: Map<MethodInfo, String>
+    val classes: Map<ClassInfo, InternalName>
 
-                ClassMappings(parsedClass, fieldz, methodz)
-            }
-            .associateByTo(mutableMapOf()) { it.clazz.oldName }
+    fun mapClassInfo(classInfo: ClassInfo): ClassInfo = this.classes[classInfo]?.let { ClassInfo(it) } ?: classInfo
 
-    override operator fun get(oldName: String): ClassMappings? = this.classes[oldName]
+    fun mapFieldInfo(fieldInfo: FieldInfo): FieldInfo = this.fields[fieldInfo]?.let { newName ->
+        FieldInfo(
+            owner = this.classes[ClassInfo(fieldInfo.owner)] ?: fieldInfo.owner,
+            name = newName,
+            desc = this.classes[ClassInfo(Type.getType(fieldInfo.desc).internalName)]
+                ?.let { Type.getObjectType(it.name) }
+                ?.descriptor
+                ?: fieldInfo.desc
+        )
+    } ?: fieldInfo
 
-    override fun toString(): String {
-        return this.classes.toString()
-    }
+    fun mapMethodInfo(methodInfo: MethodInfo): MethodInfo = this.methods[methodInfo]?.let { newName ->
+        MethodInfo(
+            owner = this.classes[ClassInfo(methodInfo.owner)] ?: methodInfo.owner,
+            name = newName,
+            desc = Type.getMethodType(methodInfo.desc).let { type ->
+                val returnType: String =
+                    this.classes[ClassInfo(type.returnType.internalName)]?.name ?: type.returnType.internalName
+                val argumentTypes: Array<Type> = type.argumentTypes.map {
+                    this.classes[ClassInfo(it.internalName)]?.name ?: it.internalName
+                }.map { Type.getObjectType(it) }.toTypedArray()
 
-    private companion object {
-        fun parseClassInfo(s: String): Class {
-            val (name, oldName) = s.split("->").map { it.trim() }
-            return Class(
-                name = name.replace(".", "/"),
-                oldName = oldName.split(":").first().replace(".", "/"),
-            )
-        }
+                Type.getMethodType(Type.getObjectType(returnType), *argumentTypes)
+            }.descriptor
+        )
+    } ?: methodInfo
 
-        fun parseFieldInfo(s: String): Field {
-            val (new, old) = s.split("->").map { it.trim() }
-            val (type, name) = new.split(" ")
-            return Field(
-                name = name,
-                type = type,
-                oldName = old
-            )
-        }
+    // a * b a.times(b) a(b()) named * intermediary named(intermediary(obf))
+    // to create a mapping from proguard to intermediary u would need:  proguard * !intermediary
+    // if mappings don't define a value, the inner value is used instead
+    // TODO: Perhaps makes this lazy
+    operator fun times(others: AtrMappings): AtrMappings = MapBackedMappings(
+        classes = others.classes.map { (classInfo, newName) ->
+            Pair(classInfo, this.classes[others.mapClassInfo(classInfo)] ?: newName)
+        }.toMap(),
+        fields = others.fields.map { (fieldInfo, newName) ->
+            Pair(fieldInfo, this.fields[others.mapFieldInfo(fieldInfo)] ?: newName)
+        }.toMap(),
+        methods = others.methods.map { (methodInfo, newName) ->
+            Pair(methodInfo, this.methods[others.mapMethodInfo(methodInfo)] ?: newName)
+        }.toMap()
+    )
 
-        fun parseMethodInfo(method: String): Method {
-            val importantPart = method.split(":").last()
-            val (new, old) = importantPart.split("->").map(String::trim)
-            val (returnType, etc) = new.split(" ")
-            val (name, argTypes) = etc.split("(")
-            val properArgTypes = argTypes.substring(0, argTypes.lastIndex)
-            val parameters = properArgTypes.split(",").filter { it.isNotEmpty() }
-
-            return Method(
-                parameters = parameters,
-                returnType = returnType,
-                oldName = old,
-                name = name
-            )
-        }
-    }
+    operator fun not(): AtrMappings = MapBackedMappings(
+        classes = this.classes.keys.associate { classInfo ->
+            Pair(this.mapClassInfo(classInfo), classInfo.internalName)
+        },
+        fields = this.fields.keys.associate { fieldInfo ->
+            Pair(this.mapFieldInfo(fieldInfo), fieldInfo.name)
+        },
+        methods = this.methods.keys.associate { methodInfo -> Pair(this.mapMethodInfo(methodInfo), methodInfo.name) }
+    )
 }
 
-class TinyV1Mappings(mappings: String, namespace: String) : Mappings {
-    var classes: Map<String, ClassMappings>
-        private set
+data class MapBackedMappings(
+    override val classes: Map<ClassInfo, InternalName>,
+    override val fields: Map<FieldInfo, String>,
+    override val methods: Map<MethodInfo, String>,
+) : AtrMappings
 
+data class InternalName(val name: String) {
     init {
+        if ('.' in name) throw IllegalArgumentException("Cannot have '.' in InternalNames")
+    }
+}
+
+typealias Descriptor = String
+
+data class FieldInfo(val owner: InternalName, val name: String, val desc: Descriptor)
+data class MethodInfo(val owner: InternalName, val name: String, val desc: Descriptor)
+data class ClassInfo(val internalName: InternalName) {
+    constructor(internalName: String) : this(InternalName(internalName))
+}
+
+class ProguardParser(private val mappings: String) : AtrParser {
+    private val classnameCache: MutableMap<String, Type> = hashMapOf()
+    private fun getTypeFromClassName(name: String): Type = classnameCache.getOrPut(name) {
+        when (name) {
+            Type.INT_TYPE.className -> Type.INT_TYPE
+            Type.BOOLEAN_TYPE.className -> Type.BOOLEAN_TYPE
+            Type.FLOAT_TYPE.className -> Type.FLOAT_TYPE
+            Type.VOID_TYPE.className -> Type.VOID_TYPE
+            Type.CHAR_TYPE.className -> Type.CHAR_TYPE
+            Type.BYTE_TYPE.className -> Type.BYTE_TYPE
+            Type.SHORT_TYPE.className -> Type.SHORT_TYPE
+            Type.LONG_TYPE.className -> Type.LONG_TYPE
+            Type.DOUBLE_TYPE.className -> Type.DOUBLE_TYPE
+            else -> {
+                if (name.endsWith("[]")) {
+                    // array
+                    val typename = name.substringBeforeLast("[]")
+                    val type = getTypeFromClassName(typename)
+                    Type.getType("[${type.descriptor}")
+                } else {
+                    // object
+                    Type.getObjectType(name.replace(".", "/"))
+                }
+            }
+        }
+    }
+
+    private fun getReversedType(reverseClasses: Map<InternalName, InternalName>, type: Type): Type = when (type.sort) {
+        Type.OBJECT -> {
+            Type.getObjectType(reverseClasses[InternalName(type.internalName)]?.name ?: type.internalName)
+        }
+
+        Type.ARRAY -> {
+            val element = this.getReversedType(reverseClasses, type.elementType)
+            Type.getType("[${element.descriptor}")
+        }
+
+        else -> type
+    }
+
+    override fun parse(): AtrMappings {
+        val classes: MutableMap<ClassInfo, InternalName> = hashMapOf()
+        val reverseClasses: MutableMap<InternalName, InternalName> = hashMapOf()
+        val intermediateFields: MutableMap<FieldInfo, String> = hashMapOf()
+        val intermediateMethods: MutableMap<MethodInfo, String> = hashMapOf()
+
+        for (clazz in mappings.lines().filter { !it.startsWith("#") }.filter { it.isNotEmpty() }
+            .chunkBy { !it.startsWith(" ") }) {
+            val lines = clazz.listIterator()
+            val classDecl = lines.next()
+            val (name, oldName) = classDecl.split("->").map { it.trim().replace(".", "/") }
+            val oldClassName = InternalName(oldName.substringBefore(":"))
+            val newClassName = InternalName(name)
+
+            classes[ClassInfo(oldClassName)] = newClassName
+            reverseClasses[newClassName] = oldClassName
+
+            for (memberLine in lines) {
+                if ('(' in memberLine) {
+                    // method
+                    // 304:312:java.lang.Object parseArgument(joptsimple.OptionSet,joptsimple.OptionSpec) -> a
+                    val importantPart = memberLine.substringAfterLast(":")
+                    val (new, oldMethodName) = importantPart.split("->").map(String::trim)
+                    val (returnType, etc) = new.split(" ")
+                    val (newMethodName, argTypes) = etc.split("(")
+                    val properArgTypes = argTypes.substring(0, argTypes.lastIndex)
+                    val parameters = properArgTypes.split(",").filter { it.isNotEmpty() }
+                    val methodInfo = MethodInfo(
+                        owner = oldClassName,
+                        name = oldMethodName,
+                        desc = Type.getMethodDescriptor(
+                            this.getTypeFromClassName(returnType),
+                            *parameters.map { this.getTypeFromClassName(it) }.toTypedArray()
+                        )
+                    )
+                    intermediateMethods[methodInfo] = newMethodName
+                } else {
+                    //field
+                    // com.mojang.authlib.properties.PropertyMap userProperties -> b
+                    // split at -> then the left is split at space. First element is type second is name and third olf name
+                    val (new, oldFieldName) = memberLine.split("->").map { it.trim() }
+                    val (type, fieldName) = new.split(" ")
+                    val fieldInfo = FieldInfo(oldClassName, oldFieldName, this.getTypeFromClassName(type).descriptor)
+                    intermediateFields[fieldInfo] = fieldName
+                }
+            }
+        }
+
+        val fields = intermediateFields.mapKeys { (fieldInfo, _) ->
+            val type = Type.getType(fieldInfo.desc)
+            val mappedType = this.getReversedType(reverseClasses, type)
+            FieldInfo(
+                fieldInfo.owner,
+                fieldInfo.name,
+                mappedType.descriptor
+            )
+        }
+
+        val methods = intermediateMethods.mapKeys { (methodInfo, _) ->
+            val methodType = Type.getMethodType(methodInfo.desc)
+            val returnType: Type = this.getReversedType(reverseClasses, methodType.returnType)
+            val parameters: Array<Type> =
+                methodType.argumentTypes.map { this.getReversedType(reverseClasses, it) }.toTypedArray()
+            MethodInfo(
+                methodInfo.owner,
+                methodInfo.name,
+                Type.getMethodDescriptor(
+                    returnType,
+                    *parameters
+                )
+            )
+        }
+        println(classnameCache.size)
+        return MapBackedMappings(classes, fields, methods)
+    }
+}
+
+class TinyV1MappingParser(private val mappings: String, private val namespace: String) : AtrParser {
+    override fun parse(): AtrMappings {
         val lines = mappings.lineSequence().iterator()
         val header = lines.next().split('\t').iterator()
         check(header.next() == "v1") { "v1 header was not detected, aborting" }
@@ -84,9 +213,10 @@ class TinyV1Mappings(mappings: String, namespace: String) : Mappings {
         val toNss = header.asSequence().toList()
         val targetNsIndex = toNss.indexOf(namespace)
         if (targetNsIndex == -1) throw IllegalArgumentException("Namespace $namespace is not specified in mappings. Available targets are $toNss")
-        val classes = hashMapOf<String, String>()
-        val fields = hashMapOf<String, MutableList<Field>>()
-        val methods = hashMapOf<String, MutableList<Method>>()
+
+        val classes = hashMapOf<ClassInfo, InternalName>()
+        val fields = hashMapOf<FieldInfo, String>()
+        val methods = hashMapOf<MethodInfo, String>()
 
         while (lines.hasNext()) {
             val curr = lines.next()
@@ -98,8 +228,8 @@ class TinyV1Mappings(mappings: String, namespace: String) : Mappings {
                 "CLASS" -> {
                     val oldName = parts.next()
                     repeat(targetNsIndex) { parts.next() } // remove all other namespaces
-                    val newName = Type.getObjectType(parts.next()).className
-                    classes[oldName] = newName
+                    val newName = parts.next()
+                    classes[ClassInfo(oldName)] = InternalName(newName)
                 }
 
                 "FIELD" -> {
@@ -108,7 +238,8 @@ class TinyV1Mappings(mappings: String, namespace: String) : Mappings {
                     val old = parts.next()
                     repeat(targetNsIndex) { parts.next() }
                     val new = parts.next()
-                    fields.getOrPut(owner, ::mutableListOf).add(Field(new, Type.getType(desc).className, old))
+                    val fieldInfo = FieldInfo(InternalName(owner), old, desc)
+                    fields[fieldInfo] = new
                 }
 
                 "METHOD" -> {
@@ -117,32 +248,14 @@ class TinyV1Mappings(mappings: String, namespace: String) : Mappings {
                     val old = parts.next()
                     repeat(targetNsIndex) { parts.next() }
                     val new = parts.next()
-                    methods.getOrPut(owner, ::mutableListOf).add(Method(new, desc, old))
+                    val methodInfo = MethodInfo(InternalName(owner), old, desc)
+                    methods[methodInfo] = new
                 }
 
                 else -> throw IllegalStateException("How did we get here?")
             }
         }
 
-        // also fix mapping types and descriptors
-        this.classes = classes.entries.map { (old, new) ->
-            val clazz = Class(new, old)
-
-            val mappedFields = fields[old]?.map { (name, oldType, oldName) ->
-                Field(name, classes[oldType] ?: oldType, oldName)
-            } ?: emptyList()
-            val mappedMethods = methods[old]?.map { (name, oldParams, oldReturnType, oldName) ->
-                Method(
-                    name,
-                    oldParams.map { classes[it] ?: it },
-                    classes[oldReturnType] ?: oldReturnType,
-                    oldName
-                )
-            } ?: emptyList()
-
-            ClassMappings(clazz, mappedFields, mappedMethods)
-        }.associateBy { it.clazz.oldName }.toMap()
+        return MapBackedMappings(classes, fields, methods)
     }
-
-    override fun get(oldName: String): ClassMappings? = this.classes[oldName]
 }

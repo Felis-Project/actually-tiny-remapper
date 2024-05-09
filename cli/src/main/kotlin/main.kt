@@ -30,13 +30,13 @@ internal class AtrCommand : CliktCommand() {
 
     override fun run() {
         val mappings = when (this.mappingFormat) {
-            MappingFormat.TinyV1 -> TinyV1Mappings(
+            MappingFormat.TinyV1 -> TinyV1MappingParser(
                 Files.readString(this.mappingFile),
                 outNs ?: throw IllegalArgumentException("You must specify an out namespace when remapping using TinyV1")
             )
 
-            MappingFormat.Proguard -> ProguardMappings(Files.readString(this.mappingFile))
-        }
+            MappingFormat.Proguard -> ProguardParser(Files.readString(this.mappingFile))
+        }.parse()
         JarRemapper(inputJar).remap(mappings, this.outputJar)
     }
 }

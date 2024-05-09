@@ -30,8 +30,6 @@ fun <T> List<T>.chunkBy(pred: (T) -> Boolean): List<List<T>> {
     return res
 }
 
-data class ClassMappings(val clazz: Class, val fields: List<Field>, val methods: List<Method>)
-
 data class ClassWrapper(val name: String, val superClass: String?, val interfaces: List<String>) {
     val parents: List<String> by lazy {
         buildList {
@@ -43,41 +41,23 @@ data class ClassWrapper(val name: String, val superClass: String?, val interface
 
 typealias ClassWrapperPool = Map<String, ClassWrapper>
 
-data class Class(val name: String, val oldName: String) {
-    val internalName by lazy { name.replace(".", "/") }
-}
-
-data class Field(val name: String, val type: String, val oldName: String)
-
-data class Method(
-    val name: String,
-    val parameters: List<String>,
-    val returnType: String,
-    val oldName: String
-) {
-    constructor(name: String, desc: String, oldName: String) : this(
-        name,
-        Type.getMethodType(desc).argumentTypes.map { it.className }.toList(),
-        Type.getMethodType(desc).returnType.className,
-        oldName
-    )
-}
-
 class AtrRemapper(
-    private val mappings: Mappings,
-    private val wrapperPool: Map<String, ClassWrapper>
+    private val mappings: AtrMappings,
+    private val wrapperPool: ClassWrapperPool,
 ) : Remapper() {
-    override fun map(internalName: String): String = this.mappings[internalName]?.clazz?.internalName ?: internalName
-    override fun mapMethodName(owner: String, name: String, descriptor: String): String {
-        if (name == "<init>" || name == "<clinit>") return name
-        // we are not in our mappings if null
-        val ownerClass = this.mappings[owner] ?: return name
-        // try to find in *this* class
-        val newName = ownerClass.methods.find { this.doesMethodMatch(it, name, descriptor) }?.name
-        // if not null we found it here
-        if (newName != null) return newName
+    override fun map(internalName: String): String =
+        this.mappings.classes[ClassInfo(internalName)]?.name ?: internalName
 
-        // otherwise we look at the parents(if they exist)
+    override fun mapMethodName(owner: String, name: String, descriptor: Descriptor): String {
+        if (owner.startsWith("java/")) return name
+        if (name == "<init>" || name == "<clinit>") return name
+
+        val methodInfo = MethodInfo(InternalName(owner), name, descriptor)
+        val mappedMethod = this.mappings.methods[methodInfo]
+
+        if (mappedMethod != null) return mappedMethod
+
+        // we look at the parents(if they exist)
         this.wrapperPool[owner]?.let { wrapper ->
             for (p in wrapper.parents) {
                 val curr = this.mapMethodName(p, name, descriptor)
@@ -92,19 +72,12 @@ class AtrRemapper(
         return name
     }
 
-    private fun doesMethodMatch(method: Method, name: String, descriptor: String): Boolean =
-        Type.getMethodType(this.mapDesc(descriptor)).let { type ->
-            method.oldName == name && // match our names
-                    method.returnType == type.returnType.className && // match our return types
-                    method.parameters.size == type.argumentTypes.size && // match our parameter count
-                    method.parameters.indices.all { method.parameters[it] == type.argumentTypes[it].className } // match our parameter types
-        }
-
     // same login as #mapMethodName
     override fun mapFieldName(owner: String, name: String, descriptor: String): String {
-        val ownerClass = this.mappings[owner] ?: return name
-        val newName = ownerClass.fields.find { this.doesFieldMatch(it, name, descriptor) }?.name
-        if (newName != null) return newName
+        if (owner.startsWith("java/")) return name
+        val fieldInfo = FieldInfo(InternalName(owner), name, descriptor)
+        val mappedField = this.mappings.fields[fieldInfo]
+        if (mappedField != null) return mappedField
 
         this.wrapperPool[owner]?.let { wrapper ->
             for (p in wrapper.parents) {
@@ -118,11 +91,6 @@ class AtrRemapper(
 
         return name
     }
-
-    private fun doesFieldMatch(field: Field, name: String, descriptor: String): Boolean =
-        Type.getType(this.mapDesc(descriptor)).let { type ->
-            field.oldName == name && field.type == type.className
-        }
 
     override fun mapRecordComponentName(owner: String, name: String, descriptor: String): String {
         return this.mapFieldName(owner, name, descriptor)
@@ -149,7 +117,7 @@ class AtrRemapper(
 //}
 
 class JarRemapper(private val jarFile: Path) {
-    fun remap(mappings: Mappings, outputJar: Path? = null): Path {
+    fun remap(mappings: AtrMappings, outputJar: Path? = null): Path {
         val jarPath = outputJar ?: this.jarFile.resolveSibling(this.jarFile.nameWithoutExtension + "-remapped.jar")
         if (jarPath.exists()) Files.delete(jarPath)
 
@@ -167,7 +135,7 @@ class JarRemapper(private val jarFile: Path) {
                 .associateBy { it.name }
                 .toMap()
 
-            val mapper = mappings.createRemapper(wrapperPool)
+            val mapper = AtrRemapper(mappings, wrapperPool)
             // second pass, actually map
             FileSystems.newFileSystem(jarPath, mapOf("create" to "true")).use { outputJar ->
                 for (file in Files.walk(originJar.rootDirectories.first()).filter { !it.isDirectory() }) {
