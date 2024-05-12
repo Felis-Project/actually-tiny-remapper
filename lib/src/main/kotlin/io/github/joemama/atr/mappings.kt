@@ -199,7 +199,6 @@ class ProguardParser(private val mappings: String) : AtrParser {
                 )
             )
         }
-        println(classnameCache.size)
         return MapBackedMappings(classes, fields, methods)
     }
 }

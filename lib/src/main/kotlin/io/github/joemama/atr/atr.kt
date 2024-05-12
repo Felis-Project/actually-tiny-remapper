@@ -92,29 +92,30 @@ class AtrRemapper(
         return name
     }
 
-    override fun mapRecordComponentName(owner: String, name: String, descriptor: String): String {
-        return this.mapFieldName(owner, name, descriptor)
-    }
+    override fun mapRecordComponentName(owner: String, name: String, descriptor: String): String =
+        this.mapFieldName(owner, name, descriptor)
 }
 
-//class VariableRenamingMethodVisitor(visitor: MethodVisitor, remapper: Remapper) : MethodRemapper(visitor, remapper) {
-//    private var internalParameterCount = 0
-//
-//    // private var internalVariableCount = 0
-//    override fun visitParameter(name: String?, access: Int) =
-//        super.visitParameter("p${this.internalParameterCount++}", access)
-//
-//    override fun visitLocalVariable(
-//        name: String,
-//        descriptor: String,
-//        signature: String?,
-//        start: Label,
-//        end: Label,
-//        index: Int
-//    ) {
-//        super.visitLocalVariable(name, descriptor, signature, start, end, index)
-//    }
-//}
+class AtrClassRemapper(del: ClassVisitor, remapper: AtrRemapper) : ClassRemapper(del, remapper) {
+    private lateinit var name: String
+    override fun visit(
+        version: Int,
+        access: Int,
+        name: String,
+        signature: String?,
+        superName: String?,
+        interfaces: Array<out String>?
+    ) {
+        this.name = name
+        super.visit(version, access, name, signature, superName, interfaces)
+    }
+
+    override fun visitSource(source: String?, debug: String?) {
+        val mappedInternalName = this.remapper.map(name)
+        val className = mappedInternalName.substringBefore("$").substringAfterLast("/") + ".java"
+        super.visitSource(className, debug)
+    }
+}
 
 class JarRemapper(private val jarFile: Path) {
     fun remap(mappings: AtrMappings, outputJar: Path? = null): Path {
@@ -145,7 +146,7 @@ class JarRemapper(private val jarFile: Path) {
                     if (file.extension == "class") {
                         val reader = Files.newInputStream(file).use { ClassReader(it) }
                         val writer = ClassWriter(0)
-                        val remapper = ClassRemapper(writer, mapper)
+                        val remapper = AtrClassRemapper(writer, mapper)
                         reader.accept(remapper, 0)
 
                         val path = outputJar.getPath(mapper.map(reader.className).replace(".", "/") + ".class")
